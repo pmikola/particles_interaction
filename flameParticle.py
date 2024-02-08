@@ -1,9 +1,10 @@
 import math
 import time
-
+from numba import jit
 import numpy as np
 import torch
 from torch import jit
+from numba.experimental import jitclass
 
 
 class flameParticle(object):
@@ -16,7 +17,7 @@ class flameParticle(object):
         self.new_acc = torch.tensor([0., 0.], device=self.device)
         self.num_of_particles = num_particles
         self.interaction_matrix = torch.zeros(self.num_of_particles, device=self.device)
-        self.time_interval = 1e-6
+        self.time_interval = 5e-7
         self.dt = 0
         self.opacity = 1.
         self.particleRadius = radius
@@ -24,13 +25,14 @@ class flameParticle(object):
         self.vel = torch.tensor([vel[0], vel[1]], device=self.device)
         self.acc = torch.tensor([acc[0], acc[1]], device=self.device)
         self.force = torch.tensor([force[0], force[1]], device=self.device)
-        self.grav_acc = torch.tensor([0., -1.], device=self.device)
+        self.grav_acc = torch.tensor([0., -9.8], device=self.device)
         self.mass = 1.
-        self.drag = 0.1
+        self.drag = 0.02
         self.air_drag = 0.99
         self.boundary_bounce_loss = 0.95
-        self.particle_particle_bounce_loss = 0.95
+        self.particle_particle_bounce_loss = 0.999
         self.live = 100
+        self.die = 0
         self.t = temperature
         # self.k_b = 1.380649e-23 # real
         self.k_b = 1.  # for simulation - fake
@@ -46,6 +48,7 @@ class flameParticle(object):
 
     def get_position(self):
         self.new_pos = self.pos + self.vel * self.dt + 0.5 * self.acc * (self.dt ** 2)
+        self.getBrownianMotion()
         self.pos = self.new_pos
 
     def get_acceleration(self):
@@ -61,7 +64,6 @@ class flameParticle(object):
         drag_acc = drag_force / self.mass
         return drag_acc
 
-
     def boundaryCollision(self, boundary_min, boundary_max):
         for i in range(2):  # Loop over x and y coordinates
             if self.pos[i] - self.particleRadius < boundary_min:
@@ -71,7 +73,6 @@ class flameParticle(object):
             if self.pos[i] + self.particleRadius > boundary_max:
                 self.pos[i] = boundary_max - self.particleRadius
                 self.vel[i] = -self.vel[i] * self.boundary_bounce_loss
-
 
     def particleCollision(self, other_particle):
         dx = self.pos[0] - other_particle.pos[0]
@@ -85,18 +86,17 @@ class flameParticle(object):
             normal = distance_vector / distance
         else:
             normal = torch.zeros_like(distance_vector, device=self.device)
-
         if distance < particle2particleRadius and self.interaction_matrix[other_particle.id] == 0:
-            # tangent = math.atan2(dy, dx)
-            # angle = 0.5 * math.pi + tangent
-            # angle = 2 * tangent - angle
-            (self.vel, other_particle.vel) = (other_particle.vel, self.vel)  # assuming masses are the same
+            v1i = self.vel
+            v2i = other_particle.vel
+            m1 = self.mass
+            m2 = other_particle.mass
+            v1f = ((m1 - m2) * v1i + 2 * m2 * v2i) / (m1 + m2)
+            v2f = ((m2 - m1) * v2i + 2 * m1 * v1i) / (m1 + m2)
+            self.vel = v1f
+            other_particle.vel = v2f
             self.vel *= self.particle_particle_bounce_loss
             other_particle.vel *= self.particle_particle_bounce_loss
-            # self.pos[0] += math.sin(angle)
-            # self.pos[1] -= math.cos(angle)
-            # other_particle.pos[0] -= math.sin(angle)
-            # other_particle.pos[1] += math.cos(angle)
             self.interaction_matrix[other_particle.id] = 1
             return other_particle
         elif self.interaction_matrix[other_particle.id] == 1 and distance > particle2particleRadius:
@@ -110,33 +110,49 @@ class flameParticle(object):
         else:
             pass
 
-    # def temp2vel_rms(self):
-    #     v = np.sqrt(3 * self.k_b * self.t / (math.pi * self.mass))
-    #     vth = np.array([v, v])
-    #     self.vel = vth
+    def temp2vel_rms(self):
+        v = np.sqrt(3 * self.k_b * self.t / (math.pi * self.mass))
+        vth = np.array([v, v])
+        self.vel += vth
     def vel_rms2temp(self):
         self.t = (2. / 3.) * torch.mean((self.vel ** 2 * torch.pi) / (2 * self.k_b * self.mass))
         # self.t = np.mean((2. / 3.) * (self.num_of_particles / self.n * self.gas_const) * ((1. / 2.) * self.mass * self.vel ** 2))
         # print(self.t)
 
     def k2rgb(self):
-        self.t = torch.clamp(self.t, 1000, 40000)
-        tmp_internal = self.t / 100.0
+        # Clamping the temperature between infrared and 40000 Kelvin
+        infrared = 500
+        self.t = torch.clamp(self.t, infrared, 40000)
 
-        red = torch.where(tmp_internal <= 66, 255, 329.698727446 * torch.pow(tmp_internal - 60, -0.1332047592))
-        green = torch.where(tmp_internal <= 66,
-                            99.4708025861 * torch.log(tmp_internal) - 161.1195681661,
-                            288.1221695283 * torch.pow(tmp_internal - 60, -0.0755148492))
+        red = torch.zeros_like(self.t,device=self.device)
+        green = torch.zeros_like(self.t,device=self.device)
+        blue = torch.zeros_like(self.t,device=self.device)
+        interp_factor = (self.t - infrared) / (1000 - 273)
+        between_mask = (self.t >= infrared) & (self.t <= 1000)
+        red[between_mask] = interp_factor[between_mask] * 255
+        green[between_mask] = interp_factor[between_mask] * 255
+        blue[between_mask] = interp_factor[between_mask] * 255
+        above_1000_mask = self.t > 1000
+        tmp_internal = self.t[above_1000_mask] / 100.0
 
-        blue = torch.where(tmp_internal >= 66, 255,
-                           torch.where(tmp_internal <= 19, 0,
-                                       138.5177312231 * torch.log(tmp_internal - 10) - 305.0447927307))
+        red[above_1000_mask] = torch.where(tmp_internal <= 66,
+                                           255,
+                                           329.698727446 * torch.pow(tmp_internal - 60, -0.1332047592))
+        green[above_1000_mask] = torch.where(tmp_internal <= 66,
+                                             99.4708025861 * torch.log(tmp_internal) - 161.1195681661,
+                                             288.1221695283 * torch.pow(tmp_internal - 60, -0.0755148492))
+        blue[above_1000_mask] = torch.where(tmp_internal >= 66,
+                                            255,
+                                            torch.where(tmp_internal <= 19,
+                                                        0,
+                                                        138.5177312231 * torch.log(tmp_internal - 10) - 305.0447927307))
 
+        # Apply hardtanh to ensure values are within [0, 1]
         redh = torch.nn.functional.hardtanh(red / 255.0, min_val=0., max_val=1.)
         greenh = torch.nn.functional.hardtanh(green / 255.0, min_val=0., max_val=1.)
         blueh = torch.nn.functional.hardtanh(blue / 255.0, min_val=0., max_val=1.)
-        return redh, greenh, blueh
 
+        return redh, greenh, blueh
 
     def getColorfromTemperature(self):
 
@@ -145,3 +161,7 @@ class flameParticle(object):
         # r, g, b = self.k2rgb()
         # r, g, b = torch.nn.functional.hardtanh(r, min_val=-0., max_val=1.).item(), torch.nn.functional.hardtanh(g, min_val=-0., max_val=1.).item(), torch.nn.functional.hardtanh(b, min_val=-0., max_val=1.).item()  # Convert tensors to Python floats or integers
         # self.particleColor = [r / 255.0, g / 255.0, b / 255.0] + [self.opacity]
+
+    def getBrownianMotion(self):
+        mean_sq_displacement = torch.nn.functional.mse_loss(self.pos,self.new_pos)
+        self.acc += torch.normal(mean=0., std=mean_sq_displacement)

@@ -4,6 +4,8 @@ import sys
 import sysconfig
 import time
 
+import torch as torch
+from numba import jit
 import torch
 
 import matplotlib
@@ -25,6 +27,7 @@ else:
     device = torch.device('cpu')  # No GPU available, fallback to CPU
     print("CUDA is not available. CPU will be used.")
 device = torch.device('cpu')
+
 
 class BoundingBox:
     def __init__(self, particle):
@@ -67,23 +70,23 @@ def check_potential_collisions(sorted_boxes_x, sorted_boxes_y):
 
 start = time.time()
 stop_sim = 0
-temperature = 2000.
-radius = 0.02
+radius = 0.01
 num_particles = 25
-no_frames = 100
-start_pos = torch.tensor([0.5, 0.5], device=device)
-start_vel = torch.tensor([5., -3.], device=device)
+no_frames = 500
+avg_velocity_propane = 810.  # m/ s
+start_pos = torch.tensor([0.5, 0.02], device=device)
+start_vel = torch.tensor([1., avg_velocity_propane ], device=device)
 start_acc = torch.tensor([0., 0.], device=device)
 start_force = torch.tensor([0., 0.], device=device)
 particles = []
 id = 0
 for _ in range(num_particles):
-    temperature = 2000.  # np.random.uniform(5000, 40000)
-    avg_velocity_propane = 810.  # m/ s
-    avg_tvelocity = 100.  # m/ s
-    start_pos = torch.rand(2, device=device)
-    start_vel = avg_tvelocity * torch.rand(2, device=device) * 2 - 1  # Random velocity between -5 and 5
-    particle = flameParticle(start_pos, start_vel, start_acc, start_force, radius, temperature, num_particles, device)
+    temperature = 12000.  # np.random.uniform(5000, 40000)
+    avg_tvelocity = 50  # m/ s
+    start_p = start_pos  # ( #+torch.rand(2, device=device)
+    start_p[0] = start_p[0] + start_p[0] * (torch.rand(1, device=device) * 2 - 1) * 0.1
+    start_v = start_vel + start_vel * (torch.rand(2, device=device) * 2 - 1) * 0.1  # - 1  # Random velocity between -5 and 5
+    particle = flameParticle(start_p, start_v, start_acc, start_force, radius, temperature, num_particles + 1, device)
     # particle.temp2vel_rms()
     particle.vel_rms2temp()
     particle.id = id
@@ -91,40 +94,51 @@ for _ in range(num_particles):
     particle.getColorfromTemperature()
     particles.append(particle)
 
-boundary_min = 0.0
+# particle = flameParticle(torch.tensor([0.5, 0.5]), torch.tensor([0.0, -avg_velocity_propane]), start_acc, start_force, radius * 5,
+#                          temperature, num_particles + 1, device)
+# # particle.temp2vel_rms()
+# particle.vel_rms2temp()
+# particle.id = id
+# particle.getColorfromTemperature()
+# particle.mass = 1e2
+# particles.append(particle)
+
+boundary_min = 0.
 boundary_max = 1.
 frame_data = []
 sim_data = []
+pprim_colides = -1
 for i in range(no_frames):
     frame_start = time.time()
     frame_data = []
-
     for p in particles:
-
         dt = i * p.time_interval
         p.dt = dt
+
         p.get_position()
         p.get_acceleration()
         p.get_velocity()
         p.boundaryCollision(boundary_min, boundary_max)
         p.vel += p.grav_acc
+
         sorted_boxes_x, sorted_boxes_y = sweep_and_prune(particles)
         potential_collisions = check_potential_collisions(sorted_boxes_x, sorted_boxes_y)
-
-        for pprim in particles:
-            if pprim == p:
-                pass
-            elif (p, pprim) in potential_collisions or (pprim, p) in potential_collisions:
-            # else:
-                pcollision = p.particleCollision(pprim)
-                if pcollision is None:
-                    pass
-                else:
-                    p.vel_rms2temp()
-                    p.getColorfromTemperature()
-                    pcollision.vel_rms2temp()
-                    pcollision.getColorfromTemperature()
-                    particles[particles.index(pprim)] = pcollision
+        # print(potential_collisions)
+        if potential_collisions is not None:
+            for pair in potential_collisions:
+                p_index = -1
+                if pair[0] == p:
+                    p_index = 1
+                elif pair[1] == p:
+                    p_index = 0
+                if p_index != -1:
+                    pcollision = p.particleCollision(pair[p_index])
+                    if pcollision is not None:
+                        p.vel_rms2temp()
+                        p.getColorfromTemperature()
+                        pcollision.vel_rms2temp()
+                        pcollision.getColorfromTemperature()
+                        particles[particles.index(pair[p_index])] = pcollision
 
         frame_data.append([p.new_pos[0].item(), p.new_pos[1].item(), p.particleRadius, p.particleColor])
     sim_data.append(frame_data)
@@ -134,7 +148,7 @@ for i in range(no_frames):
 
 end = time.time()
 print('Simulation Time : ', round(end - start, 3), ' [s]')
-
+print('FPS : ', no_frames/round(end - start, 3), ' [s]')
 draw_start = time.time()
 fig = plt.figure(figsize=(6, 6))
 plt.style.use('dark_background')
