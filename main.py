@@ -14,7 +14,9 @@ from matplotlib.animation import PillowWriter
 from matplotlib.patches import Circle
 from matplotlib import pyplot as plt, animation
 
-from flameParticle import flameParticle
+from QuadTree import Quadtree, Box
+from flameParticles import flameParticles
+from sweepAndprune import sweep_and_prune, check_potential_collisions
 
 matplotlib.use('TkAgg')
 torch.manual_seed(2024)
@@ -28,127 +30,112 @@ else:
     print("CUDA is not available. CPU will be used.")
 device = torch.device('cpu')
 
-
-class BoundingBox:
-    def __init__(self, particle):
-        self.particle = particle
-        self.min_x, self.max_x = particle.new_pos[0] - particle.particleRadius, particle.new_pos[
-            0] + particle.particleRadius
-        self.min_y, self.max_y = particle.new_pos[1] - particle.particleRadius, particle.new_pos[
-            1] + particle.particleRadius
-
-
-def sweep_and_prune(particles):
-    bounding_boxes = [BoundingBox(p) for p in particles]
-    sorted_boxes_x = sorted(bounding_boxes, key=lambda box: box.min_x)
-    sorted_boxes_y = sorted(bounding_boxes, key=lambda box: box.min_y)
-    return sorted_boxes_x, sorted_boxes_y
-
-
-def check_potential_collisions(sorted_boxes_x, sorted_boxes_y):
-    potential_collisions = []
-    for i, box_x in enumerate(sorted_boxes_x):
-        for j in range(i + 1, len(sorted_boxes_x)):
-            box_y = sorted_boxes_x[j]
-            if box_x.max_x < box_y.min_x:
-                break
-            if box_x.max_y >= box_y.min_y and box_x.min_y <= box_y.max_y:
-                if box_x.particle != box_y.particle:
-                    potential_collisions.append((box_x.particle, box_y.particle))
-
-    for i, box_y in enumerate(sorted_boxes_y):
-        for j in range(i + 1, len(sorted_boxes_y)):
-            box_x = sorted_boxes_y[j]
-            if box_y.max_y < box_x.min_y:
-                break
-            if box_y.max_x >= box_x.min_x and box_y.min_x <= box_x.max_x:
-                if box_y.particle != box_x.particle and (box_y.particle, box_x.particle) not in potential_collisions:
-                    potential_collisions.append((box_y.particle, box_x.particle))
-
-    return potential_collisions
-
-
 start = time.time()
 stop_sim = 0
-radius = 0.01
-num_particles = 25
-no_frames = 500
+num_particles = 20
+no_frames = 300
 avg_velocity_propane = 810.  # m/ s
-start_pos = torch.tensor([0.5, 0.02], device=device)
-start_vel = torch.tensor([1., avg_velocity_propane ], device=device)
-start_acc = torch.tensor([0., 0.], device=device)
-start_force = torch.tensor([0., 0.], device=device)
-particles = []
-id = 0
-for _ in range(num_particles):
-    temperature = 12000.  # np.random.uniform(5000, 40000)
-    avg_tvelocity = 50  # m/ s
-    start_p = start_pos  # ( #+torch.rand(2, device=device)
-    start_p[0] = start_p[0] + start_p[0] * (torch.rand(1, device=device) * 2 - 1) * 0.1
-    start_v = start_vel + start_vel * (torch.rand(2, device=device) * 2 - 1) * 0.1  # - 1  # Random velocity between -5 and 5
-    particle = flameParticle(start_p, start_v, start_acc, start_force, radius, temperature, num_particles + 1, device)
-    # particle.temp2vel_rms()
-    particle.vel_rms2temp()
-    particle.id = id
-    id += 1
-    particle.getColorfromTemperature()
-    particles.append(particle)
+dimensions = 2
 
-# particle = flameParticle(torch.tensor([0.5, 0.5]), torch.tensor([0.0, -avg_velocity_propane]), start_acc, start_force, radius * 5,
-#                          temperature, num_particles + 1, device)
-# # particle.temp2vel_rms()
-# particle.vel_rms2temp()
-# particle.id = id
-# particle.getColorfromTemperature()
-# particle.mass = 1e2
-# particles.append(particle)
+
+def initTensor(dim, num_particles, fill_value=0., multiple_X=1., multiple_Y=1., offset_X=0., offset_Y=0., scale=2.,
+               noise_amp_x=0.0,
+               noise_amp_y=0.0, device=device):
+    tensor = torch.full((dim, num_particles), fill_value, device=device)
+
+    tensor[0] *= multiple_X
+    tensor[0] += (torch.rand(num_particles, device=device) * scale - scale / 2.) * noise_amp_x - offset_X
+
+    if dim > 1:
+        tensor[1] *= multiple_Y
+        tensor[1] += (torch.rand(num_particles, device=device) * scale - scale / 2.) * noise_amp_y - offset_Y
+
+    return tensor
+
+
+start_pos = initTensor(dim=dimensions, num_particles=num_particles, fill_value=1.,
+                       multiple_X=1., multiple_Y=1.,
+                       offset_X=0.5, offset_Y=0.9, scale=2.,
+                       noise_amp_x=0.1, noise_amp_y=0.1, device=device)
+
+start_vel = initTensor(dim=dimensions, num_particles=num_particles, fill_value=1.,
+                       multiple_X=1., multiple_Y=avg_velocity_propane,
+                       offset_X=0., offset_Y=0.0, scale=2.,
+                       noise_amp_x=120., noise_amp_y=0.5, device=device)
+start_acc = initTensor(dim=dimensions, num_particles=num_particles, device=device)
+start_forces = initTensor(dim=dimensions, num_particles=num_particles, device=device)
+temperatures = initTensor(dim=1, num_particles=num_particles, fill_value=10000., noise_amp_x=5000, device=device)
+pradius = initTensor(dim=dimensions, num_particles=num_particles, fill_value=0.03, noise_amp_x=0.0, noise_amp_y=0.0,
+                     device=device)
+
+particles = flameParticles(start_pos, start_vel, start_acc, start_forces, pradius, temperatures, num_particles, device)
+particles.vel_rms2temp()
+particles.getColorfromTemperature()
 
 boundary_min = 0.
 boundary_max = 1.
 frame_data = []
 sim_data = []
 pprim_colides = -1
+
 for i in range(no_frames):
     frame_start = time.time()
     frame_data = []
-    for p in particles:
-        dt = i * p.time_interval
-        p.dt = dt
+    dt = i * particles.time_interval
+    particles.dt = dt
+    particles.get_position()
+    particles.get_acceleration()
+    particles.get_velocity()
+    particles.boundaryCollision(boundary_min, boundary_max)
+    particles.vel += particles.grav_acc.view(-1, 1)
 
-        p.get_position()
-        p.get_acceleration()
-        p.get_velocity()
-        p.boundaryCollision(boundary_min, boundary_max)
-        p.vel += p.grav_acc
-
-        sorted_boxes_x, sorted_boxes_y = sweep_and_prune(particles)
-        potential_collisions = check_potential_collisions(sorted_boxes_x, sorted_boxes_y)
+    # Clear the quadtree before inserting particles for the current frame
+    quadtree = Quadtree(Box(0, 0, boundary_max, boundary_max), 4)  # Assuming width and height are known
+    for idx, (x, y) in enumerate(zip(particles.pos[0], particles.pos[1])):
+        quadtree.insert(particles.pos[0][idx], particles.pos[1][idx])
+        pbox = Box(x, y, 5 * (particles.particleRadius[0][idx]),
+                   5 * (particles.particleRadius[0][idx]))
+        potential_collisions = quadtree.query(pbox)  # Find potential collisions for current particle
         # print(potential_collisions)
-        if potential_collisions is not None:
-            for pair in potential_collisions:
-                p_index = -1
-                if pair[0] == p:
-                    p_index = 1
-                elif pair[1] == p:
-                    p_index = 0
-                if p_index != -1:
-                    pcollision = p.particleCollision(pair[p_index])
-                    if pcollision is not None:
-                        p.vel_rms2temp()
-                        p.getColorfromTemperature()
-                        pcollision.vel_rms2temp()
-                        pcollision.getColorfromTemperature()
-                        particles[particles.index(pair[p_index])] = pcollision
+        for other_idx in potential_collisions:
+            if other_idx != idx:
+                print(other_idx)
+                particles.particleCollision(idx, other_idx)
+                particles.vel_rms2temp()
+                particles.getColorfromTemperature()
 
-        frame_data.append([p.new_pos[0].item(), p.new_pos[1].item(), p.particleRadius, p.particleColor])
-    sim_data.append(frame_data)
+    particles.vel_rms2temp()
+    particles.getColorfromTemperature()
+
+    # sorted_boxes_x, sorted_boxes_y = sweep_and_prune(particles)
+    # potential_collisions = check_potential_collisions(sorted_boxes_x, sorted_boxes_y)
+    # print(potential_collisions)
+
+    # TODO: CHANGE SWEEP AND PRUNE TO QUADTREE ALGORITHM
+    # if potential_collisions is not None:
+    #     for pair in potential_collisions:
+    #         p_index = -1
+    #         if pair[0] == p:
+    #             p_index = 1
+    #         elif pair[1] == p:
+    #             p_index = 0
+    #         if p_index != -1:
+    #             pcollision = p.particleCollision(pair[p_index])
+    #             if pcollision is not None:
+    #                 p.vel_rms2temp()
+    #                 p.getColorfromTemperature()
+    #                 pcollision.vel_rms2temp()
+    #                 pcollision.getColorfromTemperature()
+    #                 particles[particles.index(pair[p_index])] = pcollision
+
+    sim_data.append([particles.new_pos[0], particles.new_pos[1], particles.particleRadius, particles.particleColor])
 
     frame_end = time.time()
     # print('Loop time:', round((frame_end - frame_start), 3), '[s]',' iter: ',i)
 
 end = time.time()
 print('Simulation Time : ', round(end - start, 3), ' [s]')
-print('FPS : ', no_frames/round(end - start, 3), ' [s]')
+print('FPS : ', no_frames / round((1e-3 + end) - start, 3), ' [fps]')
 draw_start = time.time()
 fig = plt.figure(figsize=(6, 6))
 plt.style.use('dark_background')
@@ -157,11 +144,19 @@ grid = plt.GridSpec(20, 20, wspace=2, hspace=0.6)
 ax = fig.add_subplot(grid[:, :])
 ims = []
 
-for i in range(len(sim_data)):
+for i in range(no_frames):
     pf = []
-    for j in range(len(sim_data[i])):
-        # Create Circle patches for each particle in the current frame
-        pp = Circle((sim_data[i][j][0], sim_data[i][j][1]), sim_data[i][j][2], color=sim_data[i][j][3])
+    for j in range(num_particles):
+        pos_x = sim_data[i][0][j].cpu().detach().numpy()
+        pos_y = sim_data[i][1][j].cpu().detach().numpy()
+        radi = sim_data[i][2][0][j].cpu().detach().numpy()
+
+        colors = []
+        for k in range(0, 4):
+            col = sim_data[i][3][k].cpu().detach().numpy()
+            colors.append(col[j])
+        #     # Create Circle patches for each particle in the current frame
+        pp = Circle((pos_x, pos_y), radi, color=colors)
         pf.append(pp)
         ax.add_patch(pp)
     # Append the list of patches for the current frame to ims

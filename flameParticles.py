@@ -7,35 +7,36 @@ from torch import jit
 from numba.experimental import jitclass
 
 
-class flameParticle(object):
-    def __init__(self, pos, vel, acc, force, radius, temperature, num_particles, device):
+class flameParticles(object):
+    def __init__(self, pos, vel, acc, forces, radius, temperature, num_particles, device):
         self.particleColor = None
-        self.id = None
+        self.id = torch.range(start=0, end=num_particles - 1, step=1)
         self.device = device
-        self.new_pos = torch.rand(2, device=self.device)
-        self.new_vel = torch.rand(2, device=self.device) * 2 - 1
-        self.new_acc = torch.tensor([0., 0.], device=self.device)
+        self.new_pos = torch.tensor(pos, device=self.device)
+        self.new_vel = torch.tensor(vel, device=self.device)
+        self.new_acc = torch.tensor(acc, device=self.device)
         self.num_of_particles = num_particles
-        self.interaction_matrix = torch.zeros(self.num_of_particles, device=self.device)
+        self.interaction_matrix = torch.zeros((self.num_of_particles, self.num_of_particles), device=self.device)
         self.time_interval = 5e-7
         self.dt = 0
-        self.opacity = 1.
+        self.opacity = torch.full((1, self.num_of_particles), 1.0, device=self.device)
         self.particleRadius = radius
-        self.pos = torch.tensor([pos[0], pos[1]], device=self.device)
-        self.vel = torch.tensor([vel[0], vel[1]], device=self.device)
-        self.acc = torch.tensor([acc[0], acc[1]], device=self.device)
-        self.force = torch.tensor([force[0], force[1]], device=self.device)
-        self.grav_acc = torch.tensor([0., -9.8], device=self.device)
-        self.mass = 1.
+        self.pos = torch.tensor(pos, device=self.device)
+        self.vel = torch.tensor(vel, device=self.device)
+        self.acc = torch.tensor(acc, device=self.device)
+        self.force = torch.tensor(forces, device=self.device)
+        self.grav_acc = torch.tensor([0., -19.8], device=self.device)
+        self.mass = torch.full((1, self.num_of_particles), 1.0, device=self.device)
         self.drag = 0.02
         self.air_drag = 0.99
+        self.pi = torch.full((1, self.num_of_particles), torch.pi, device=self.device)
         self.boundary_bounce_loss = 0.95
         self.particle_particle_bounce_loss = 0.999
-        self.live = 100
+        self.live = torch.full((1, self.num_of_particles), 100, device=self.device)
         self.die = 0
         self.t = temperature
         # self.k_b = 1.380649e-23 # real
-        self.k_b = 1.  # for simulation - fake
+        self.k_b = torch.full((1, self.num_of_particles), 1.0, device=self.device)  # for simulation - fake
         self.n_a = 6.0221e+23  # avogardo number
         self.molar_mass = 44.097  # propan  molar mass g/mol
         # self.n = self.mass / self.molar_mass
@@ -65,48 +66,53 @@ class flameParticle(object):
         return drag_acc
 
     def boundaryCollision(self, boundary_min, boundary_max):
-        for i in range(2):  # Loop over x and y coordinates
-            if self.pos[i] - self.particleRadius < boundary_min:
-                self.pos[i] = boundary_min + self.particleRadius
-                self.vel[i] = -self.vel[i] * self.boundary_bounce_loss
+        for i in range(2):
+            crossed_min = self.pos[i] - self.particleRadius[i] < boundary_min
+            crossed_max = self.pos[i] + self.particleRadius[i] > boundary_max
+            self.pos[i][crossed_min] = boundary_min + self.particleRadius[i][crossed_min]
+            self.vel[i][crossed_min] = -self.vel[i][crossed_min] * self.boundary_bounce_loss
+            self.pos[i][crossed_max] = boundary_max - self.particleRadius[i][crossed_max]
+            self.vel[i][crossed_max] = -self.vel[i][crossed_max] * self.boundary_bounce_loss
 
-            if self.pos[i] + self.particleRadius > boundary_max:
-                self.pos[i] = boundary_max - self.particleRadius
-                self.vel[i] = -self.vel[i] * self.boundary_bounce_loss
-
-    def particleCollision(self, other_particle):
-        dx = self.pos[0] - other_particle.pos[0]
-        dy = self.pos[1] - other_particle.pos[1]
+    def particleCollision(self, i, ii):
+        # dx = -(self.pos[0][:, None] - self.pos[0].ravel()).reshape(*self.pos[0].shape, *self.pos[0].shape)
+        # dy = -(self.pos[1][:, None] - self.pos[1].ravel()).reshape(*self.pos[1].shape, *self.pos[1].shape)
+        # distance = torch.hypot(dx, dy)
+        # particle2particleRadius = (self.particleRadius[0][:, None] + self.particleRadius[0].ravel()).reshape(
+        #     *self.particleRadius[0].shape, *self.particleRadius[0].shape)
+        #
+        # print(particle2particleRadius)
+        interaction = self.interaction_matrix[i, ii]
+        dx = self.pos[0][i] - self.pos[0][ii]
+        dy = self.pos[1][i] - self.pos[1][ii]
         distance = torch.hypot(dx, dy)
         # distance = np.linalg.norm(other_particle.pos - self.pos)
-        particle2particleRadius = (self.particleRadius + other_particle.particleRadius)
-        distance_vector = (other_particle.pos - self.pos)
+        particle2particleRadius = (self.particleRadius[0][i] + self.particleRadius[0][ii])
+
+        distance_vector = (self.pos[:][:, i] - self.pos[:][:, ii])
         # normal = distance_vector / distance
         if distance != 0:
             normal = distance_vector / distance
         else:
             normal = torch.zeros_like(distance_vector, device=self.device)
-        if distance < particle2particleRadius and self.interaction_matrix[other_particle.id] == 0:
-            v1i = self.vel
-            v2i = other_particle.vel
-            m1 = self.mass
-            m2 = other_particle.mass
+        if distance < particle2particleRadius and interaction == 0:
+            v1i = self.vel[:][:, i].clone()
+            v2i = self.vel[:][:, ii].clone()
+            m1 = self.mass[:][:, i]
+            m2 = self.mass[:][:, i]
             v1f = ((m1 - m2) * v1i + 2 * m2 * v2i) / (m1 + m2)
             v2f = ((m2 - m1) * v2i + 2 * m1 * v1i) / (m1 + m2)
-            self.vel = v1f
-            other_particle.vel = v2f
+            self.vel[:][:, i] = v1f
+            self.vel[:][:, ii] = v2f
             self.vel *= self.particle_particle_bounce_loss
-            other_particle.vel *= self.particle_particle_bounce_loss
-            self.interaction_matrix[other_particle.id] = 1
-            return other_particle
-        elif self.interaction_matrix[other_particle.id] == 1 and distance > particle2particleRadius:
-            self.interaction_matrix[other_particle.id] = 0
-            return other_particle
-        elif self.interaction_matrix[other_particle.id] == 1 and distance < particle2particleRadius:
+            self.vel[:][:, ii] *= self.particle_particle_bounce_loss
+            self.interaction_matrix[i, ii] = 1
+        elif interaction == 1 and distance > particle2particleRadius:
+            self.interaction_matrix[i, ii] = 0
+        elif interaction == 1 and distance < particle2particleRadius:
             repulsion = torch.multiply(normal, particle2particleRadius - distance)
-            self.pos -= repulsion / self.mass
-            other_particle.pos += repulsion / other_particle.mass
-            return other_particle
+            self.pos[:][:, i] -= repulsion / self.mass[:][:, i]
+            self.pos[:][:, ii] += repulsion / self.mass[:][:, ii]
         else:
             pass
 
@@ -114,19 +120,21 @@ class flameParticle(object):
         v = np.sqrt(3 * self.k_b * self.t / (math.pi * self.mass))
         vth = np.array([v, v])
         self.vel += vth
+
     def vel_rms2temp(self):
-        self.t = (2. / 3.) * torch.mean((self.vel ** 2 * torch.pi) / (2 * self.k_b * self.mass))
+        tK = (self.vel ** 2 * self.pi) / (2 * self.k_b * self.mass)
+        self.t = (2. / 3.) * torch.mean(tK, dim=0)
         # self.t = np.mean((2. / 3.) * (self.num_of_particles / self.n * self.gas_const) * ((1. / 2.) * self.mass * self.vel ** 2))
-        # print(self.t)
 
     def k2rgb(self):
         # Clamping the temperature between infrared and 40000 Kelvin
         infrared = 500
+
         self.t = torch.clamp(self.t, infrared, 40000)
 
-        red = torch.zeros_like(self.t,device=self.device)
-        green = torch.zeros_like(self.t,device=self.device)
-        blue = torch.zeros_like(self.t,device=self.device)
+        red = torch.zeros_like(self.t, device=self.device)
+        green = torch.zeros_like(self.t, device=self.device)
+        blue = torch.zeros_like(self.t, device=self.device)
         interp_factor = (self.t - infrared) / (1000 - 273)
         between_mask = (self.t >= infrared) & (self.t <= 1000)
         red[between_mask] = interp_factor[between_mask] * 255
@@ -147,21 +155,21 @@ class flameParticle(object):
                                                         0,
                                                         138.5177312231 * torch.log(tmp_internal - 10) - 305.0447927307))
 
-        # Apply hardtanh to ensure values are within [0, 1]
         redh = torch.nn.functional.hardtanh(red / 255.0, min_val=0., max_val=1.)
         greenh = torch.nn.functional.hardtanh(green / 255.0, min_val=0., max_val=1.)
         blueh = torch.nn.functional.hardtanh(blue / 255.0, min_val=0., max_val=1.)
 
-        return redh, greenh, blueh
+        return redh, greenh, blueh, self.opacity[0]
 
     def getColorfromTemperature(self):
-
-        self.particleColor = list(map(lambda div: div.item(), self.k2rgb())) + [self.opacity]
+        self.particleColor = self.k2rgb()
         # print(self.particleColor)
         # r, g, b = self.k2rgb()
         # r, g, b = torch.nn.functional.hardtanh(r, min_val=-0., max_val=1.).item(), torch.nn.functional.hardtanh(g, min_val=-0., max_val=1.).item(), torch.nn.functional.hardtanh(b, min_val=-0., max_val=1.).item()  # Convert tensors to Python floats or integers
         # self.particleColor = [r / 255.0, g / 255.0, b / 255.0] + [self.opacity]
 
     def getBrownianMotion(self):
-        mean_sq_displacement = torch.nn.functional.mse_loss(self.pos,self.new_pos)
-        self.acc += torch.normal(mean=0., std=mean_sq_displacement)
+        # mean_sq_displacement = torch.nn.functional.mse_loss(self.pos, self.new_pos)
+        mean_sq_displacement = (self.new_pos - self.pos) ** 2
+        # print(mean_sq_displacement)
+        self.acc += self.acc * torch.normal(mean=0., std=mean_sq_displacement)
