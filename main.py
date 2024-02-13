@@ -33,7 +33,7 @@ device = torch.device('cpu')
 start = time.time()
 stop_sim = 0
 num_particles = 20
-no_frames = 300
+no_frames = 200
 avg_velocity_propane = 810.  # m/ s
 dimensions = 2
 
@@ -65,7 +65,7 @@ start_vel = initTensor(dim=dimensions, num_particles=num_particles, fill_value=1
 start_acc = initTensor(dim=dimensions, num_particles=num_particles, device=device)
 start_forces = initTensor(dim=dimensions, num_particles=num_particles, device=device)
 temperatures = initTensor(dim=1, num_particles=num_particles, fill_value=10000., noise_amp_x=5000, device=device)
-pradius = initTensor(dim=dimensions, num_particles=num_particles, fill_value=0.03, noise_amp_x=0.0, noise_amp_y=0.0,
+pradius = initTensor(dim=dimensions, num_particles=num_particles, fill_value=0.02, noise_amp_x=0.0, noise_amp_y=0.0,
                      device=device)
 
 particles = flameParticles(start_pos, start_vel, start_acc, start_forces, pradius, temperatures, num_particles, device)
@@ -88,21 +88,18 @@ for i in range(no_frames):
     particles.get_velocity()
     particles.boundaryCollision(boundary_min, boundary_max)
     particles.vel += particles.grav_acc.view(-1, 1)
-
-    # Clear the quadtree before inserting particles for the current frame
-    quadtree = Quadtree(Box(0, 0, boundary_max, boundary_max), 4)  # Assuming width and height are known
+    pbox = Box(0.0, 0.0, boundary_max, boundary_max)
+    quadtree = Quadtree(pbox, 5, device)
     for idx, (x, y) in enumerate(zip(particles.pos[0], particles.pos[1])):
-        quadtree.insert(particles.pos[0][idx], particles.pos[1][idx])
-        pbox = Box(x, y, 5 * (particles.particleRadius[0][idx]),
-                   5 * (particles.particleRadius[0][idx]))
-        potential_collisions = quadtree.query(pbox)  # Find potential collisions for current particle
-        # print(potential_collisions)
-        for other_idx in potential_collisions:
-            if other_idx != idx:
-                print(other_idx)
+        quadtree.insert(x, y)
+        potential_collisions = quadtree.query(pbox)
+        print(potential_collisions[:])
+        time.sleep(1)
+        for other_idx in range(len(potential_collisions)):
+            if potential_collisions[other_idx] != idx:
                 particles.particleCollision(idx, other_idx)
-                particles.vel_rms2temp()
-                particles.getColorfromTemperature()
+                # particles.vel_rms2temp()
+                # particles.getColorfromTemperature()
 
     particles.vel_rms2temp()
     particles.getColorfromTemperature()
@@ -135,7 +132,7 @@ for i in range(no_frames):
 
 end = time.time()
 print('Simulation Time : ', round(end - start, 3), ' [s]')
-print('FPS : ', no_frames / round((1e-3 + end) - start, 3), ' [fps]')
+print('FPS : ', round(no_frames / (end - start), 2), ' [fps]')
 draw_start = time.time()
 fig = plt.figure(figsize=(6, 6))
 plt.style.use('dark_background')
@@ -166,7 +163,7 @@ ani = animation.ArtistAnimation(fig, ims, interval=30, blit=True, repeat=True)
 draw_stop = time.time()
 print('Drawing Time : ', round(draw_stop - draw_start, 3), ' [s]')
 
-# ani.save("particles_diffiusion2.gif", dpi=300, writer=PillowWriter(fps=25))
+ani.save("particles_diffiusion2.gif", dpi=300, writer=PillowWriter(fps=25))
 
 # plt.grid()
 plt.show()

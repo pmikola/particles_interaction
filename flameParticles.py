@@ -17,7 +17,7 @@ class flameParticles(object):
         self.new_acc = torch.tensor(acc, device=self.device)
         self.num_of_particles = num_particles
         self.interaction_matrix = torch.zeros((self.num_of_particles, self.num_of_particles), device=self.device)
-        self.time_interval = 5e-7
+        self.time_interval = 2e-6
         self.dt = 0
         self.opacity = torch.full((1, self.num_of_particles), 1.0, device=self.device)
         self.particleRadius = radius
